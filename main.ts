@@ -7,6 +7,9 @@ interface HistoryRow {
   market_cap_lamports: string | number;
   venue: string;
   created_at?: string;
+  complete?: boolean;
+  mayhem?: boolean;
+  symbol?: string;
 }
 
 interface Mark {
@@ -16,24 +19,58 @@ interface Mark {
 }
 
 interface Task {
-  history_until: string;
   reads: string[];
-  places?: number;
+  cadence_minutes?: number;
   size: { edges: number[] };
+}
+
+type Group = 'P' | 'C';
+
+interface Point {
+  time: number;
+  logCap: number;
+  group: Group;
 }
 
 interface Coin {
   mint: string;
+  symbol: string;
   createdAt: number;
-  series: Array<{ time: number; capSol: number }>;
-  firstWindowCap?: number;
+  series: Point[];
   lastSeenCap: number;
+  lastLogCap: number;
   lastRank: number;
-  score: number;
+  lastVenue: string;
+  lastComplete: boolean;
+  lastMayhem: boolean;
+  lastGroup: Group;
 }
 
-interface ScoredCoin extends Coin {
-  expectedRank: number;
+interface StepSample {
+  increment: number;
+  age: number;
+}
+
+interface Dynamics {
+  mu: number;
+  sd: number;
+  pCrash: number;
+  crashSize: number;
+  drifts: number[];
+}
+
+interface FieldCoin {
+  logCap: number;
+  birthStep: number;
+  order: number;
+}
+
+interface RankedItem {
+  logCap: number;
+  candidateIndex?: number;
+  fieldIndex?: number;
+  birthStep?: number;
+  order: number;
 }
 
 const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
@@ -49,35 +86,36 @@ const marks = parsedMarks
 
 if (marks.length === 0) throw new Error('history must contain successful marks with rows');
 if (!Array.isArray(task.reads) || task.reads.length === 0) throw new Error('task must contain answer reads');
-if (!Array.isArray(task.size?.edges) || task.size.edges.length === 0) {
-  throw new Error('task must contain size-bin edges');
+if (!Array.isArray(task.size?.edges) || task.size.edges.length !== 81) {
+  throw new Error('task size must contain 81 edges');
 }
-
 if (marks.some(({ time }) => !Number.isFinite(time))) throw new Error('history contains an invalid mark time');
 marks.sort((a, b) => a.time - b.time || a.index - b.index);
-const markTimes = marks.map(({ time }) => time);
-const firstTime = markTimes[0]!;
-const lastTime = markTimes[markTimes.length - 1]!;
-const span = Math.max(0, lastTime - firstTime);
-const windowStart = lastTime - span / 4;
-const timeScale = Math.max(span / 4, 60_000);
-const coins = new Map<string, Coin>();
 
-function median(values: number[]): number {
-  const sorted = [...values].sort((a, b) => a - b);
-  const middle = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 0
-    ? (sorted[middle - 1]! + sorted[middle]!) / 2
-    : sorted[middle]!;
+const stepMs = (task.cadence_minutes ?? 10) * 60_000;
+if (!Number.isFinite(stepMs) || stepMs <= 0) throw new Error('invalid history cadence');
+const edges = task.size.edges;
+if (edges.some((edge, index) => !Number.isFinite(edge) || (index > 0 && edge <= edges[index - 1]!))) {
+  throw new Error('task size-bin edges must be finite and increasing');
 }
+const allReadTimes = task.reads.map((read) => Date.parse(read));
+if (allReadTimes.some((time) => !Number.isFinite(time))) throw new Error('task contains an invalid answer read time');
+const reads = allReadTimes
+  .map((time, index) => ({ time, index }))
+  .sort((a, b) => a.time - b.time || a.index - b.index);
+const firstNonemptyIndex = marks.findIndex(({ mark }) => mark.rows!.length > 0);
+if (firstNonemptyIndex < 0) throw new Error('history contains no ranked rows');
+
+const coins = new Map<string, Coin>();
+const newcomerCaps: number[] = [];
+let newcomerMarks = 0;
 
 for (let markIndex = 0; markIndex < marks.length; markIndex++) {
-  const mark = marks[markIndex]!.mark;
-  const markTime = markTimes[markIndex]!;
-  const timeWeight = 0.5 ** ((lastTime - markTime) / timeScale);
+  const { mark, time: markTime } = marks[markIndex]!;
+  if (markIndex > firstNonemptyIndex) newcomerMarks++;
 
   for (const row of mark.rows!) {
-    if (typeof row.mint !== 'string' || !Number.isFinite(row.rank) || row.rank < 1) {
+    if (typeof row.mint !== 'string' || row.mint.length === 0 || !Number.isFinite(row.rank) || row.rank < 1) {
       throw new Error('history contains an invalid ranked row');
     }
 
@@ -88,232 +126,358 @@ for (let markIndex = 0; markIndex < marks.length; markIndex++) {
       throw new Error(`invalid market cap for ${row.mint}`);
     }
     if (capLamports <= 0n) throw new Error(`invalid market cap for ${row.mint}`);
-    const cap = Number(capLamports);
-    if (!Number.isFinite(cap)) throw new Error(`market cap is out of range for ${row.mint}`);
-    const capSol = cap / 1e9;
-    const createdAt = row.created_at === undefined ? markTime : Date.parse(row.created_at);
-    if (!Number.isFinite(createdAt)) throw new Error(`invalid creation time for ${row.mint}`);
+    const capNumber = Number(capLamports);
+    if (!Number.isFinite(capNumber)) throw new Error(`market cap is out of range for ${row.mint}`);
+    const capSol = capNumber / 1e9;
+    const logCap = Math.log10(capSol);
+    if (!Number.isFinite(logCap)) throw new Error(`invalid market cap for ${row.mint}`);
+    const seenBefore = coins.has(row.mint);
 
-    let coin = coins.get(row.mint);
-    if (coin === undefined) {
-      coin = {
+    if (!seenBefore) {
+      const createdAt = row.created_at === undefined ? markTime : Date.parse(row.created_at);
+      if (!Number.isFinite(createdAt)) throw new Error(`invalid creation time for ${row.mint}`);
+      const coin: Coin = {
         mint: row.mint,
+        symbol: typeof row.symbol === 'string' && row.symbol.length > 0 ? row.symbol : row.mint,
         createdAt,
         series: [],
-        ...(markTime >= windowStart ? { firstWindowCap: cap } : {}),
-        lastSeenCap: cap,
+        lastSeenCap: capNumber,
+        lastLogCap: logCap,
         lastRank: row.rank,
-        score: 0,
+        lastVenue: row.venue,
+        lastComplete: row.complete === true,
+        lastMayhem: row.mayhem === true,
+        lastGroup: row.venue === 'pool' || row.complete === true ? 'P' : 'C',
       };
       coins.set(row.mint, coin);
+      if (markIndex > firstNonemptyIndex && row.rank <= 100) newcomerCaps.push(logCap);
     } else {
-      if (coin.firstWindowCap === undefined && markTime >= windowStart) {
-        coin.firstWindowCap = cap;
-      }
-      coin.lastSeenCap = cap;
+      const coin = coins.get(row.mint)!;
+      coin.lastSeenCap = capNumber;
+      coin.lastLogCap = logCap;
       coin.lastRank = row.rank;
+      coin.lastVenue = row.venue;
+      coin.lastComplete = row.complete === true;
+      coin.lastMayhem = row.mayhem === true;
+      coin.lastGroup = row.venue === 'pool' || row.complete === true ? 'P' : 'C';
+      if (coin.symbol === coin.mint && typeof row.symbol === 'string' && row.symbol.length > 0) {
+        coin.symbol = row.symbol;
+      }
     }
-    coin.series.push({ time: markTime, capSol });
 
-    if (row.rank <= 40) {
-      coin.score +=
-        timeWeight * ((41 - row.rank) / 40) * (row.venue === 'pool' ? 1.25 : 1);
+    const coin = coins.get(row.mint)!;
+    coin.series.push({
+      time: markTime,
+      logCap,
+      group: row.venue === 'pool' || row.complete === true ? 'P' : 'C',
+    });
+  }
+}
+
+const incrementSamples: StepSample[] = [];
+const groupSamples: Record<Group, StepSample[]> = { P: [], C: [] };
+const ageBoundaries = [0.25, 0.5, 1, 2, 4];
+
+for (const coin of coins.values()) {
+  for (let pointIndex = 1; pointIndex < coin.series.length; pointIndex++) {
+    const first = coin.series[pointIndex - 1]!;
+    const second = coin.series[pointIndex]!;
+    const steps = Math.max(1, Math.round((second.time - first.time) / stepMs));
+    const sample: StepSample = {
+      increment: (second.logCap - first.logCap) / steps,
+      age: (first.time - coin.createdAt) / 3_600_000,
+    };
+    incrementSamples.push(sample);
+    groupSamples[first.group].push(sample);
+  }
+}
+
+function computeDynamics(samples: StepSample[]): Dynamics {
+  const mu = samples.length === 0
+    ? 0
+    : samples.reduce((sum, sample) => sum + sample.increment, 0) / samples.length;
+  const variance = samples.length === 0
+    ? 0
+    : samples.reduce((sum, sample) => sum + (sample.increment - mu) ** 2, 0) / samples.length;
+  const sd = Math.max(0.05, Math.min(0.3, Math.sqrt(variance)));
+  const crashes = samples.filter((sample) => sample.increment < -0.45);
+  const pCrash = Math.max(0.005, Math.min(0.08, crashes.length / Math.max(1, samples.length)));
+  const crashMean = crashes.length === 0
+    ? -0.7
+    : crashes.reduce((sum, sample) => sum + sample.increment, 0) / crashes.length;
+  const crashSize = Math.max(-1.2, Math.min(-0.45, crashMean));
+  const drifts = Array.from({ length: ageBoundaries.length + 1 }, (_, bin) => {
+    const lower = bin === 0 ? -Infinity : ageBoundaries[bin - 1]!;
+    const upper = ageBoundaries[bin] ?? Infinity;
+    const inBin = samples.filter((sample) => sample.age >= lower && sample.age < upper);
+    const sum = inBin.reduce((total, sample) => total + sample.increment, 0);
+    return (sum + 10 * mu) / (inBin.length + 10);
+  });
+  return { mu, sd, pCrash, crashSize, drifts };
+}
+
+const globalDynamics = computeDynamics(incrementSamples);
+const dynamicsByGroup: Record<Group, Dynamics> = {
+  P: groupSamples.P.length >= 150 ? computeDynamics(groupSamples.P) : globalDynamics,
+  C: groupSamples.C.length >= 150 ? computeDynamics(groupSamples.C) : globalDynamics,
+};
+
+function ageBin(age: number): number {
+  for (let index = 0; index < ageBoundaries.length; index++) {
+    if (age < ageBoundaries[index]!) return index;
+  }
+  return ageBoundaries.length;
+}
+
+const newcomerLambda = newcomerCaps.length === 0
+  ? 0
+  : Math.max(0, Math.min(60, newcomerCaps.length / Math.max(1, newcomerMarks)));
+
+const nonemptyMarks = marks.filter(({ mark }) => mark.rows!.length > 0);
+const lastMark = nonemptyMarks[nonemptyMarks.length - 1]!;
+const lastMarkTime = lastMark.time;
+const lastMarkRows = lastMark.mark.rows!;
+const lastMarkMints = new Set(lastMarkRows.map((row) => row.mint));
+const orderedLastRows = [...lastMarkRows].sort((a, b) => a.rank - b.rank);
+const rankFiveRow = orderedLastRows.find((row) => row.rank === 5) ?? orderedLastRows[4];
+const rankFiveCap = rankFiveRow === undefined
+  ? 0
+  : Number(BigInt(rankFiveRow.market_cap_lamports));
+const candidatesUnfiltered = [...coins.values()].filter(
+  (coin) => lastMarkMints.has(coin.mint) || coin.lastSeenCap >= rankFiveCap / 10 ** 1.5,
+);
+const byLastCap = (a: Coin, b: Coin): number =>
+  b.lastSeenCap - a.lastSeenCap || (a.mint < b.mint ? -1 : a.mint > b.mint ? 1 : 0);
+let candidateCoins = candidatesUnfiltered.sort(byLastCap).slice(0, 240);
+if (candidateCoins.length < 5) candidateCoins = [...coins.values()].sort(byLastCap).slice(0, 240);
+if (candidateCoins.length < 5) throw new Error('history does not contain five distinct forecast candidates');
+
+const candidates = candidateCoins.map((coin) => {
+  const lastPoint = coin.series[coin.series.length - 1]!;
+  let startLogCap = coin.lastLogCap;
+  if (!lastMarkMints.has(coin.mint)) {
+    const missedSteps = Math.round((lastMarkTime - lastPoint.time) / stepMs);
+    startLogCap += Math.min(0, globalDynamics.mu) * missedSteps;
+  }
+  return { coin, startLogCap };
+});
+
+function mulberry32(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) | 0;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4_294_967_296;
+  };
+}
+
+const random = mulberry32(0x9e3779b9);
+let spareGaussian: number | undefined;
+function gaussian(): number {
+  if (spareGaussian !== undefined) {
+    const value = spareGaussian;
+    spareGaussian = undefined;
+    return value;
+  }
+  let first = random();
+  while (first <= 0) first = random();
+  const second = random();
+  const radius = Math.sqrt(-2 * Math.log(first));
+  const angle = 2 * Math.PI * second;
+  spareGaussian = radius * Math.sin(angle);
+  return radius * Math.cos(angle);
+}
+
+function poisson(lambda: number): number {
+  if (lambda <= 0) return 0;
+  if (lambda >= 30) return Math.max(0, Math.round(lambda + Math.sqrt(lambda) * gaussian()));
+  const limit = Math.exp(-lambda);
+  let product = 1;
+  let count = 0;
+  do {
+    count++;
+    product *= random();
+  } while (product > limit);
+  return count - 1;
+}
+
+function evolve(logCap: number, group: Group, age: number): number {
+  const dynamics = dynamicsByGroup[group];
+  const drift = dynamics.drifts[ageBin(age)]!;
+  const delta = random() < dynamics.pCrash
+    ? dynamics.crashSize + 0.1 * gaussian()
+    : drift + dynamics.sd * gaussian();
+  return logCap + delta;
+}
+
+function binOf(logCap: number): number {
+  let low = 0;
+  let high = edges.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (logCap < edges[middle]!) high = middle;
+    else low = middle + 1;
+  }
+  return low;
+}
+
+const lastReadTime = reads[reads.length - 1]!.time;
+const stepsToLastRead = Math.max(1, Math.ceil((lastReadTime - lastMarkTime) / stepMs));
+const numCandidates = candidates.length;
+const numSims = Math.max(600, Math.min(3000, Math.floor(9_000_000 / Math.max(1, stepsToLastRead * (numCandidates + 48)))));
+const targetSteps = reads.map(({ time }) => Math.max(1, Math.ceil((time - lastMarkTime) / stepMs)));
+const placeCounts = new Uint32Array(numCandidates * 5);
+const sizeCounts = new Uint32Array(5 * 82);
+let fieldOrder = 0;
+
+for (let simulation = 0; simulation < numSims; simulation++) {
+  const state = candidates.map((candidate) => candidate.startLogCap);
+  let field: FieldCoin[] = [];
+  let currentStep = 0;
+
+  for (let readIndex = 0; readIndex < reads.length; readIndex++) {
+    const targetStep = targetSteps[readIndex]!;
+    while (currentStep < targetStep) {
+      const nextStep = currentStep + 1;
+      const elapsedAtStart = currentStep * stepMs;
+      for (let index = 0; index < candidates.length; index++) {
+        const coin = candidates[index]!.coin;
+        const age = (lastMarkTime + elapsedAtStart - coin.createdAt) / 3_600_000;
+        state[index] = evolve(state[index]!, coin.lastGroup, age);
+      }
+
+      const spawnCount = newcomerCaps.length === 0 ? 0 : poisson(newcomerLambda);
+      for (let index = 0; index < spawnCount; index++) {
+        const selected = Math.floor(random() * newcomerCaps.length);
+        field.push({
+          logCap: newcomerCaps[selected]!,
+          birthStep: nextStep,
+          order: fieldOrder++,
+        });
+      }
+      for (const newcomer of field) {
+        const age = ((nextStep - newcomer.birthStep) * stepMs) / 3_600_000;
+        newcomer.logCap = evolve(newcomer.logCap, 'C', age);
+      }
+      field.sort((a, b) => b.logCap - a.logCap || a.birthStep - b.birthStep || a.order - b.order);
+      if (field.length > 48) field.length = 48;
+      currentStep = nextStep;
+    }
+
+    const ranked: RankedItem[] = candidates.map((candidate, candidateIndex) => ({
+      logCap: state[candidateIndex]!,
+      candidateIndex,
+      order: candidateIndex,
+    }));
+    for (let fieldIndex = 0; fieldIndex < field.length; fieldIndex++) {
+      const newcomer = field[fieldIndex]!;
+      ranked.push({
+        logCap: newcomer.logCap,
+        fieldIndex,
+        birthStep: newcomer.birthStep,
+        order: newcomer.order,
+      });
+    }
+    ranked.sort((a, b) => {
+      const byCap = b.logCap - a.logCap;
+      if (byCap !== 0) return byCap;
+      const aIsCandidate = a.candidateIndex !== undefined;
+      const bIsCandidate = b.candidateIndex !== undefined;
+      if (aIsCandidate !== bIsCandidate) return aIsCandidate ? -1 : 1;
+      if (aIsCandidate) return a.candidateIndex! - b.candidateIndex!;
+      return a.birthStep! - b.birthStep! || a.order - b.order;
+    });
+
+    for (let placeIndex = 0; placeIndex < 5; placeIndex++) {
+      const holder = ranked[placeIndex]!;
+      if (holder.candidateIndex !== undefined) {
+        placeCounts[holder.candidateIndex * 5 + placeIndex]++;
+      }
+      sizeCounts[placeIndex * 82 + binOf(holder.logCap)]++;
     }
   }
 }
 
-for (const coin of coins.values()) {
-  const growth = coin.firstWindowCap === undefined ? 1 : coin.lastSeenCap / coin.firstWindowCap;
-  const logGrowth = Math.log10(growth);
-  const momentum = Math.max(-0.3, Math.min(0.7, logGrowth));
-  coin.score *= 1 + 0.35 * momentum;
+function round6(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000;
 }
 
-const lifecycleSamples = [...coins.values()]
-  .filter((coin) => coin.series.length >= 2)
-  .map((coin) => {
-    let peak = coin.series[0]!;
-    let sumX = 0;
-    let sumY = 0;
-    const points = coin.series.map((point) => {
-      if (point.capSol > peak.capSol) peak = point;
-      const x = (point.time - coin.series[0]!.time) / 3_600_000;
-      const y = Math.log10(point.capSol);
-      sumX += x;
-      sumY += y;
-      return { x, y };
-    });
-    const meanX = sumX / points.length;
-    const meanY = sumY / points.length;
-    let covariance = 0;
-    let variance = 0;
-    for (const point of points) {
-      covariance += (point.x - meanX) * (point.y - meanY);
-      variance += (point.x - meanX) ** 2;
-    }
-    const slope = variance === 0 ? 0 : covariance / variance;
-    return {
-      peakAge: (peak.time - coin.createdAt) / 3_600_000,
-      slope,
-    };
-  });
-const peakAge = lifecycleSamples.length === 0
-  ? 1.5
-  : Math.max(0.5, Math.min(3, median(lifecycleSamples.map((sample) => sample.peakAge))));
-const riseSlopes = lifecycleSamples.map((sample) => sample.slope).filter((slope) => slope > 0);
-const decaySlopes = lifecycleSamples.map((sample) => sample.slope).filter((slope) => slope < 0);
-const rise = riseSlopes.length === 0
-  ? 0.8
-  : Math.max(0.1, Math.min(2, median(riseSlopes)));
-const decay = decaySlopes.length === 0
-  ? -0.35
-  : Math.max(-1.5, Math.min(-0.1, median(decaySlopes)));
-
-const readTimes = task.reads.map((read) => Date.parse(read)).sort((a, b) => a - b);
-if (readTimes.some((time) => !Number.isFinite(time))) throw new Error('task contains an invalid answer read time');
-const historyEnd = Date.parse(task.history_until);
-if (!Number.isFinite(historyEnd)) throw new Error('task contains an invalid history end time');
-const medianRead = readTimes[Math.floor(readTimes.length / 2)]!;
-const horizonHours = (medianRead - historyEnd) / 3_600_000;
-if (horizonHours < 0) throw new Error('invalid forecast horizon');
-
-for (const coin of coins.values()) {
-  const age = (lastTime - coin.createdAt) / 3_600_000;
-  const riseHours = Math.max(0, peakAge - age);
-  let projectedLogCap =
-    Math.log10(coin.lastSeenCap) +
-    rise * Math.min(riseHours, horizonHours) +
-    decay * Math.max(0, horizonHours - riseHours);
-  projectedLogCap = Math.min(projectedLogCap, Math.log10(coin.lastSeenCap) + 1);
-  coin.score *= Math.sqrt(10 ** (projectedLogCap - Math.log10(coin.lastSeenCap)));
-}
-
-const byScore = (a: Coin, b: Coin): number =>
-  b.score - a.score || (a.mint < b.mint ? -1 : a.mint > b.mint ? 1 : 0);
-const allByScore = [...coins.values()].sort(byScore);
-const topScoreMints = new Set(allByScore.slice(0, 50).map((coin) => coin.mint));
-const candidates = allByScore.filter((coin) => coin.lastRank <= 60 || topScoreMints.has(coin.mint));
-if (candidates.length < 5) throw new Error('history does not contain five forecast candidates');
-
-const totalScore = candidates.reduce((sum, coin) => sum + coin.score, 0);
-if (!(totalScore > 0)) throw new Error('candidate scores must have a positive sum');
-
-let cumulativeScore = 0;
-const rankedCandidates: ScoredCoin[] = candidates.map((coin) => {
-  const expectedRank = 1 + (cumulativeScore / totalScore) * 40;
-  cumulativeScore += coin.score;
-  return { ...coin, expectedRank };
-});
-
-const sigma = Math.min(2.2 + 0.08 * horizonHours, 3.2);
-const namedMass = Math.max(0.45 - 0.013 * horizonHours, 0.3);
-const placeWeights = new Map<number, number[]>();
+const observationCount = numSims * reads.length;
 const probabilities: Array<{ mint: string; place: number; p: number }> = [];
-const places = task.places ?? 5;
-
-for (let place = 1; place <= places; place++) {
-  const kernels = rankedCandidates.map((coin) => {
-    const difference = coin.expectedRank - place;
-    return Math.exp(-(difference * difference) / (2 * sigma * sigma));
-  });
-  const kernelSum = kernels.reduce((sum, value) => sum + value, 0);
-  if (!(kernelSum > 0)) throw new Error(`place ${place} has no candidate weight`);
-  const weights = kernels.map((value) => value / kernelSum);
-  placeWeights.set(place, weights);
-
-  const rows = rankedCandidates
-    .map((coin, index) => ({ mint: coin.mint, place, p: namedMass * weights[index]! }))
-    .filter((row) => row.p >= 0.001)
+for (let placeIndex = 0; placeIndex < 5; placeIndex++) {
+  const rows = candidates
+    .map(({ coin }, candidateIndex) => ({
+      mint: coin.mint,
+      place: placeIndex + 1,
+      p: placeCounts[candidateIndex * 5 + placeIndex]! / observationCount,
+    }))
+    .filter((row) => row.p >= 0.0008)
     .sort((a, b) => b.p - a.p || (a.mint < b.mint ? -1 : a.mint > b.mint ? 1 : 0))
-    .slice(0, 100);
+    .slice(0, 100)
+    .map((row) => ({ ...row, p: round6(row.p) }));
+  let totalMicros = rows.reduce((sum, row) => sum + Math.round(row.p * 1_000_000), 0);
+  if (totalMicros > 1_000_000 && rows.length > 0) {
+    const largestMicros = Math.round(rows[0]!.p * 1_000_000);
+    rows[0]!.p = Math.max(0, largestMicros - (totalMicros - 1_000_000)) / 1_000_000;
+    totalMicros = rows.reduce((sum, row) => sum + Math.round(row.p * 1_000_000), 0);
+    while (totalMicros > 1_000_000) {
+      rows[0]!.p = Math.max(0, Math.round(rows[0]!.p * 1_000_000) - 1) / 1_000_000;
+      totalMicros = rows.reduce((sum, row) => sum + Math.round(row.p * 1_000_000), 0);
+    }
+  }
   probabilities.push(...rows);
 }
+probabilities.sort(
+  (a, b) =>
+    a.place - b.place || b.p - a.p || (a.mint < b.mint ? -1 : a.mint > b.mint ? 1 : 0),
+);
 
-const top5 = rankedCandidates
-  .map((coin, index) => ({
-    mint: coin.mint,
-    expectation: Array.from(placeWeights.values()).reduce((sum, weights) => sum + weights[index]!, 0),
-  }))
-  .sort((a, b) => b.expectation - a.expectation || (a.mint < b.mint ? -1 : a.mint > b.mint ? 1 : 0))
-  .slice(0, 5)
-  .map((coin) => coin.mint);
-
-function erfc(value: number): number {
-  const z = Math.abs(value);
-  const t = 1 / (1 + 0.5 * z);
-  const approximation =
-    t *
-    Math.exp(
-      -z * z -
-        1.26551223 +
-        t *
-          (1.00002368 +
-            t *
-              (0.37409196 +
-                t *
-                  (0.09678418 +
-                    t *
-                      (-0.18628806 +
-                        t *
-                          (0.27886807 +
-                            t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))),
-    );
-  return value >= 0 ? approximation : 2 - approximation;
-}
-
-function normalTail(value: number, mean: number, standardDeviation: number): number {
-  if (value === -Infinity) return 1;
-  if (value === Infinity) return 0;
-  return 0.5 * erfc((value - mean) / (standardDeviation * Math.SQRT2));
-}
-
-const edges = task.size.edges;
-if (edges.some((edge, index) => !Number.isFinite(edge) || (index > 0 && edge <= edges[index - 1]!))) {
-  throw new Error('task size-bin edges must be finite and increasing');
-}
-const standardDeviation = Math.min(0.35 + 0.04 * horizonHours, 0.75);
-const lastMarkCaps = new Map<string, number>();
-for (const row of marks[marks.length - 1]!.mark.rows!) {
-  lastMarkCaps.set(row.mint, Number(BigInt(row.market_cap_lamports)));
+const candidatesByExpectation = candidates
+  .map(({ coin }, candidateIndex) => {
+    let probabilitySum = 0;
+    let weightedPlace = 0;
+    for (let placeIndex = 0; placeIndex < 5; placeIndex++) {
+      const count = placeCounts[candidateIndex * 5 + placeIndex]!;
+      probabilitySum += count;
+      weightedPlace += (placeIndex + 1) * count;
+    }
+    return {
+      coin,
+      probabilitySum,
+      expectedPlace: probabilitySum > 0 ? weightedPlace / probabilitySum : Infinity,
+      candidateIndex,
+    };
+  })
+  .filter((candidate) => candidate.probabilitySum > 0)
+  .sort(
+    (a, b) =>
+      b.probabilitySum - a.probabilitySum ||
+      a.expectedPlace - b.expectedPlace ||
+      (a.coin.mint < b.coin.mint ? -1 : a.coin.mint > b.coin.mint ? 1 : 0),
+  );
+const topCandidates = candidatesByExpectation.slice(0, 5).map((candidate) => candidate.coin.mint);
+if (topCandidates.length < 5) {
+  for (const candidate of candidates) {
+    if (!topCandidates.includes(candidate.coin.mint)) topCandidates.push(candidate.coin.mint);
+    if (topCandidates.length === 5) break;
+  }
 }
 
 const sizes: Array<{ place: number; bin: number; p: number }> = [];
-for (let place = 1; place <= places; place++) {
-  const weights = placeWeights.get(place)!;
-  let weightedLogCap = 0;
-  let mostLikelyIndex = 0;
-  for (let index = 0; index < rankedCandidates.length; index++) {
-    const coin = rankedCandidates[index]!;
-    const growth = coin.firstWindowCap === undefined ? 1 : coin.lastSeenCap / coin.firstWindowCap;
-    const projectedCapSol = (coin.lastSeenCap / 1e9) * growth ** 0.25;
-    weightedLogCap += weights[index]! * Math.log10(projectedCapSol);
-    if (weights[index]! > weights[mostLikelyIndex]!) mostLikelyIndex = index;
-  }
-
-  const expectedCoin = rankedCandidates[mostLikelyIndex]!;
-  const expectedCap = lastMarkCaps.get(expectedCoin.mint) ?? expectedCoin.lastSeenCap;
-  const mean = 0.5 * Math.log10(expectedCap / 1e9) + 0.5 * weightedLogCap;
-  const binProbabilities: number[] = [];
-  for (let bin = 0; bin <= edges.length; bin++) {
-    const low = bin === 0 ? -Infinity : edges[bin - 1]!;
-    const high = bin === edges.length ? Infinity : edges[bin]!;
-    binProbabilities.push(
-      Math.max(0, normalTail(low, mean, standardDeviation) - normalTail(high, mean, standardDeviation)),
-    );
-  }
-  const binTotal = binProbabilities.reduce((sum, value) => sum + value, 0);
-  if (!(binTotal > 0)) throw new Error(`place ${place} has no size-bin probability`);
-  let emittedTotal = 0;
-  for (let bin = 0; bin < binProbabilities.length; bin++) {
-    const probability =
-      bin === binProbabilities.length - 1
-        ? Math.max(0, 1 - emittedTotal)
-        : binProbabilities[bin]! / binTotal;
-    sizes.push({ place, bin, p: probability });
-    emittedTotal += probability;
+for (let placeIndex = 0; placeIndex < 5; placeIndex++) {
+  const counts = Array.from({ length: 82 }, (_, bin) => sizeCounts[placeIndex * 82 + bin]!);
+  const denominator = observationCount + 0.6 * 82;
+  const roundedMicros = counts.map((count) => Math.round(((count + 0.6) / denominator) * 1_000_000));
+  const largestBin = counts.reduce((best, count, bin) => (count > counts[best]! ? bin : best), 0);
+  const roundedTotal = roundedMicros.reduce((sum, value) => sum + value, 0);
+  roundedMicros[largestBin] = Math.max(0, roundedMicros[largestBin]! + 1_000_000 - roundedTotal);
+  for (let bin = 0; bin < 82; bin++) {
+    sizes.push({ place: placeIndex + 1, bin, p: roundedMicros[bin]! / 1_000_000 });
   }
 }
 
-const forecast = { probabilities, top5, sizes };
+const forecast = { probabilities, top5: topCandidates, sizes };
 mkdirSync(outputDir, { recursive: true });
 writeFileSync(join(outputDir, 'forecast.json'), `${JSON.stringify(forecast)}\n`);
