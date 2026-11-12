@@ -6,6 +6,7 @@ interface HistoryRow {
   rank: number;
   market_cap_lamports: string | number;
   venue: string;
+  created_at?: string;
 }
 
 interface Mark {
@@ -23,6 +24,8 @@ interface Task {
 
 interface Coin {
   mint: string;
+  createdAt: number;
+  series: Array<{ time: number; capSol: number }>;
   firstWindowCap?: number;
   lastSeenCap: number;
   lastRank: number;
@@ -60,6 +63,14 @@ const windowStart = lastTime - span / 4;
 const timeScale = Math.max(span / 4, 60_000);
 const coins = new Map<string, Coin>();
 
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[middle - 1]! + sorted[middle]!) / 2
+    : sorted[middle]!;
+}
+
 for (let markIndex = 0; markIndex < marks.length; markIndex++) {
   const mark = marks[markIndex]!.mark;
   const markTime = markTimes[markIndex]!;
@@ -79,11 +90,16 @@ for (let markIndex = 0; markIndex < marks.length; markIndex++) {
     if (capLamports <= 0n) throw new Error(`invalid market cap for ${row.mint}`);
     const cap = Number(capLamports);
     if (!Number.isFinite(cap)) throw new Error(`market cap is out of range for ${row.mint}`);
+    const capSol = cap / 1e9;
+    const createdAt = row.created_at === undefined ? markTime : Date.parse(row.created_at);
+    if (!Number.isFinite(createdAt)) throw new Error(`invalid creation time for ${row.mint}`);
 
     let coin = coins.get(row.mint);
     if (coin === undefined) {
       coin = {
         mint: row.mint,
+        createdAt,
+        series: [],
         ...(markTime >= windowStart ? { firstWindowCap: cap } : {}),
         lastSeenCap: cap,
         lastRank: row.rank,
@@ -97,6 +113,7 @@ for (let markIndex = 0; markIndex < marks.length; markIndex++) {
       coin.lastSeenCap = cap;
       coin.lastRank = row.rank;
     }
+    coin.series.push({ time: markTime, capSol });
 
     if (row.rank <= 40) {
       coin.score +=
@@ -110,6 +127,65 @@ for (const coin of coins.values()) {
   const logGrowth = Math.log10(growth);
   const momentum = Math.max(-0.3, Math.min(0.7, logGrowth));
   coin.score *= 1 + 0.35 * momentum;
+}
+
+const lifecycleSamples = [...coins.values()]
+  .filter((coin) => coin.series.length >= 2)
+  .map((coin) => {
+    let peak = coin.series[0]!;
+    let sumX = 0;
+    let sumY = 0;
+    const points = coin.series.map((point) => {
+      if (point.capSol > peak.capSol) peak = point;
+      const x = (point.time - coin.series[0]!.time) / 3_600_000;
+      const y = Math.log10(point.capSol);
+      sumX += x;
+      sumY += y;
+      return { x, y };
+    });
+    const meanX = sumX / points.length;
+    const meanY = sumY / points.length;
+    let covariance = 0;
+    let variance = 0;
+    for (const point of points) {
+      covariance += (point.x - meanX) * (point.y - meanY);
+      variance += (point.x - meanX) ** 2;
+    }
+    const slope = variance === 0 ? 0 : covariance / variance;
+    return {
+      peakAge: (peak.time - coin.createdAt) / 3_600_000,
+      slope,
+    };
+  });
+const peakAge = lifecycleSamples.length === 0
+  ? 1.5
+  : Math.max(0.5, Math.min(3, median(lifecycleSamples.map((sample) => sample.peakAge))));
+const riseSlopes = lifecycleSamples.map((sample) => sample.slope).filter((slope) => slope > 0);
+const decaySlopes = lifecycleSamples.map((sample) => sample.slope).filter((slope) => slope < 0);
+const rise = riseSlopes.length === 0
+  ? 0.8
+  : Math.max(0.1, Math.min(2, median(riseSlopes)));
+const decay = decaySlopes.length === 0
+  ? -0.35
+  : Math.max(-1.5, Math.min(-0.1, median(decaySlopes)));
+
+const readTimes = task.reads.map((read) => Date.parse(read)).sort((a, b) => a - b);
+if (readTimes.some((time) => !Number.isFinite(time))) throw new Error('task contains an invalid answer read time');
+const historyEnd = Date.parse(task.history_until);
+if (!Number.isFinite(historyEnd)) throw new Error('task contains an invalid history end time');
+const medianRead = readTimes[Math.floor(readTimes.length / 2)]!;
+const horizonHours = (medianRead - historyEnd) / 3_600_000;
+if (horizonHours < 0) throw new Error('invalid forecast horizon');
+
+for (const coin of coins.values()) {
+  const age = (lastTime - coin.createdAt) / 3_600_000;
+  const riseHours = Math.max(0, peakAge - age);
+  let projectedLogCap =
+    Math.log10(coin.lastSeenCap) +
+    rise * Math.min(riseHours, horizonHours) +
+    decay * Math.max(0, horizonHours - riseHours);
+  projectedLogCap = Math.min(projectedLogCap, Math.log10(coin.lastSeenCap) + 1);
+  coin.score *= Math.sqrt(10 ** (projectedLogCap - Math.log10(coin.lastSeenCap)));
 }
 
 const byScore = (a: Coin, b: Coin): number =>
@@ -128,14 +204,6 @@ const rankedCandidates: ScoredCoin[] = candidates.map((coin) => {
   cumulativeScore += coin.score;
   return { ...coin, expectedRank };
 });
-
-const readTimes = task.reads.map((read) => Date.parse(read)).sort((a, b) => a - b);
-if (readTimes.some((time) => !Number.isFinite(time))) throw new Error('task contains an invalid answer read time');
-const historyEnd = Date.parse(task.history_until);
-if (!Number.isFinite(historyEnd)) throw new Error('task contains an invalid history end time');
-const medianRead = readTimes[Math.floor(readTimes.length / 2)]!;
-const horizonHours = (medianRead - historyEnd) / 3_600_000;
-if (horizonHours < 0) throw new Error('invalid forecast horizon');
 
 const sigma = Math.min(2.2 + 0.08 * horizonHours, 3.2);
 const namedMass = Math.max(0.45 - 0.013 * horizonHours, 0.3);
