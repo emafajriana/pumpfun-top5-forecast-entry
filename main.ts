@@ -32,12 +32,12 @@ interface Task {
 const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const task = JSON.parse(readFileSync(join(inputDir, 'task.json'), 'utf8')) as Task;
-const marks = readFileSync(join(inputDir, 'history.ndjson'), 'utf8')
+const allMarks = readFileSync(join(inputDir, 'history.ndjson'), 'utf8')
   .split('\n')
   .filter((line) => line.length > 0)
   .map((line) => JSON.parse(line) as Mark);
-
-if (marks.length === 0 || marks.some((mark) => !mark.ok || !Array.isArray(mark.rows))) {
+const marks = allMarks.filter((mark) => mark.ok && Array.isArray(mark.rows));
+if (marks.length === 0) {
   throw new Error('history must contain successful marks with rows');
 }
 if (task.reads.length === 0) throw new Error('task must contain answer reads');
