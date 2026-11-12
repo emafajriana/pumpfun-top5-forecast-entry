@@ -16,7 +16,7 @@ interface Mark {
 
 interface Coin {
   mint: string;
-  firstCap: number;
+  windowFirstCap?: number;
   lastSeenCap: number;
   lastCap: number;
   lastRank: number;
@@ -47,6 +47,7 @@ if (markTimes.some((time) => !Number.isFinite(time))) throw new Error('history c
 const firstTime = markTimes[0]!;
 const lastTime = markTimes[markTimes.length - 1]!;
 const span = lastTime - firstTime;
+const growthWindowStart = lastTime - span / 4;
 const timeScale = Math.max(span / 4, 60_000);
 const coins = new Map<string, Coin>();
 
@@ -62,7 +63,7 @@ for (let markIndex = 0; markIndex < marks.length; markIndex++) {
     if (coin === undefined) {
       coin = {
         mint: row.mint,
-        firstCap: cap,
+        ...(markTimes[markIndex]! >= growthWindowStart ? { windowFirstCap: cap } : {}),
         lastSeenCap: cap,
         lastCap: cap,
         lastRank: row.rank,
@@ -70,6 +71,9 @@ for (let markIndex = 0; markIndex < marks.length; markIndex++) {
       };
       coins.set(row.mint, coin);
     } else {
+      if (coin.windowFirstCap === undefined && markTimes[markIndex]! >= growthWindowStart) {
+        coin.windowFirstCap = cap;
+      }
       coin.lastSeenCap = cap;
       coin.lastCap = cap;
       coin.lastRank = row.rank;
@@ -82,7 +86,8 @@ for (let markIndex = 0; markIndex < marks.length; markIndex++) {
 }
 
 for (const coin of coins.values()) {
-  const logGrowth = Math.log10(coin.lastSeenCap / coin.firstCap);
+  const growth = coin.windowFirstCap === undefined ? 1 : coin.lastSeenCap / coin.windowFirstCap;
+  const logGrowth = Math.log10(growth);
   const clampedGrowth = Math.max(-0.3, Math.min(0.7, logGrowth));
   coin.score *= 1 + 0.35 * clampedGrowth;
 }
@@ -177,7 +182,7 @@ for (let place = 1; place <= 5; place++) {
   let weightedLogCap = 0;
   for (let index = 0; index < candidates.length; index++) {
     const coin = candidates[index]!;
-    const growth = coin.lastSeenCap / coin.firstCap;
+    const growth = coin.windowFirstCap === undefined ? 1 : coin.lastSeenCap / coin.windowFirstCap;
     const projectedCapSol = (coin.lastSeenCap / 1e9) * growth ** 0.25;
     weightedLogCap += weights[index]! * Math.log10(projectedCapSol);
   }
