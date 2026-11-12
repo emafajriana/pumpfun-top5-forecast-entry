@@ -106,13 +106,21 @@ const reads = allReadTimes
 const firstNonemptyIndex = marks.findIndex(({ mark }) => mark.rows!.length > 0);
 if (firstNonemptyIndex < 0) throw new Error('history contains no ranked rows');
 
+function clamp(value: number, low: number, high: number): number {
+  return Math.max(low, Math.min(high, value));
+}
+
 const coins = new Map<string, Coin>();
 const newcomerCaps: number[] = [];
 let newcomerMarks = 0;
+let marksWithRows = 0;
 
 for (let markIndex = 0; markIndex < marks.length; markIndex++) {
   const { mark, time: markTime } = marks[markIndex]!;
-  if (markIndex > firstNonemptyIndex) newcomerMarks++;
+  if (mark.rows!.length > 0) {
+    if (marksWithRows > 0) newcomerMarks++;
+    marksWithRows++;
+  }
 
   for (const row of mark.rows!) {
     if (typeof row.mint !== 'string' || row.mint.length === 0 || !Number.isFinite(row.rank) || row.rank < 1) {
@@ -193,15 +201,18 @@ for (const coin of coins.values()) {
 }
 
 function computeDynamics(samples: StepSample[]): Dynamics {
+  const sampleCount = samples.length;
   const mu = samples.length === 0
     ? 0
     : samples.reduce((sum, sample) => sum + sample.increment, 0) / samples.length;
   const variance = samples.length === 0
     ? 0
     : samples.reduce((sum, sample) => sum + (sample.increment - mu) ** 2, 0) / samples.length;
-  const sd = Math.max(0.05, Math.min(0.3, Math.sqrt(variance)));
+  const shrinkage = sampleCount / (sampleCount + 150);
+  const sd = clamp(Math.sqrt(variance) * shrinkage + 0.12 * (1 - shrinkage), 0.05, 0.3);
   const crashes = samples.filter((sample) => sample.increment < -0.45);
-  const pCrash = Math.max(0.005, Math.min(0.08, crashes.length / Math.max(1, samples.length)));
+  const crashShare = crashes.length / Math.max(1, sampleCount);
+  const pCrash = clamp(crashShare * shrinkage + 0.02 * (1 - shrinkage), 0.005, 0.08);
   const crashMean = crashes.length === 0
     ? -0.7
     : crashes.reduce((sum, sample) => sum + sample.increment, 0) / crashes.length;
@@ -231,7 +242,11 @@ function ageBin(age: number): number {
 
 const newcomerLambda = newcomerCaps.length === 0
   ? 0
-  : Math.max(0, Math.min(60, newcomerCaps.length / Math.max(1, newcomerMarks)));
+  : clamp(
+      (newcomerCaps.length / Math.max(1, newcomerMarks)) * (newcomerMarks / (newcomerMarks + 2)),
+      0,
+      40,
+    );
 
 const nonemptyMarks = marks.filter(({ mark }) => mark.rows!.length > 0);
 const lastMark = nonemptyMarks[nonemptyMarks.length - 1]!;
@@ -261,6 +276,33 @@ const candidates = candidateCoins.map((coin) => {
   }
   return { coin, startLogCap };
 });
+
+const levelSlopes = Array.from({ length: 5 }, (_, placeIndex) => {
+  const observations: Array<{ time: number; logCap: number }> = [];
+  for (const { mark, time } of marks) {
+    const row = mark.rows!.find((candidate) => candidate.rank === placeIndex + 1);
+    if (row === undefined) continue;
+    const logCap = Math.log10(Number(BigInt(row.market_cap_lamports)) / 1e9);
+    observations.push({ time, logCap });
+  }
+  if (observations.length < 2) return 0;
+  const meanTime = observations.reduce((sum, point) => sum + point.time, 0) / observations.length;
+  const meanCap = observations.reduce((sum, point) => sum + point.logCap, 0) / observations.length;
+  let covariance = 0;
+  let variance = 0;
+  for (const point of observations) {
+    const elapsedHours = (point.time - meanTime) / 3_600_000;
+    covariance += elapsedHours * (point.logCap - meanCap);
+    variance += elapsedHours * elapsedHours;
+  }
+  const slope = variance === 0 ? 0 : covariance / variance;
+  return clamp(slope * (marksWithRows / (marksWithRows + 3)), -0.05, 0.25);
+});
+const levelSlope = clamp(
+  [...levelSlopes].sort((a, b) => a - b)[Math.floor(levelSlopes.length / 2)]!,
+  0,
+  0.2,
+);
 
 function mulberry32(seed: number): () => number {
   let state = seed >>> 0;
@@ -352,7 +394,7 @@ for (let simulation = 0; simulation < numSims; simulation++) {
       for (let index = 0; index < spawnCount; index++) {
         const selected = Math.floor(random() * newcomerCaps.length);
         field.push({
-          logCap: newcomerCaps[selected]!,
+          logCap: newcomerCaps[selected]! + levelSlope * ((nextStep * stepMs) / 3_600_000),
           birthStep: nextStep,
           order: fieldOrder++,
         });
@@ -404,6 +446,23 @@ function round6(value: number): number {
   return Math.round(value * 1_000_000) / 1_000_000;
 }
 
+const priorWeight = clamp(1.2 / Math.max(1, marksWithRows), 0.1, 0.65);
+const candidateCapTotal = candidates.reduce((sum, candidate) => sum + candidate.coin.lastSeenCap, 0);
+const priorExpectedRanks: number[] = [];
+let priorCumulativeShare = 0;
+for (const candidate of candidates) {
+  priorExpectedRanks.push(1 + priorCumulativeShare * 40);
+  priorCumulativeShare += candidate.coin.lastSeenCap / candidateCapTotal;
+}
+const priorPlaceProbabilities = Array.from({ length: 5 }, (_, placeIndex) => {
+  const weights = priorExpectedRanks.map((expectedRank) => {
+    const difference = expectedRank - (placeIndex + 1);
+    return Math.exp(-(difference * difference) / (2 * 2.4 * 2.4));
+  });
+  const total = weights.reduce((sum, weight) => sum + weight, 0);
+  return weights.map((weight) => (0.45 * weight) / total);
+});
+
 const observationCount = numSims * reads.length;
 const probabilities: Array<{ mint: string; place: number; p: number }> = [];
 for (let placeIndex = 0; placeIndex < 5; placeIndex++) {
@@ -411,7 +470,9 @@ for (let placeIndex = 0; placeIndex < 5; placeIndex++) {
     .map(({ coin }, candidateIndex) => ({
       mint: coin.mint,
       place: placeIndex + 1,
-      p: placeCounts[candidateIndex * 5 + placeIndex]! / observationCount,
+      p:
+        (1 - priorWeight) * (placeCounts[candidateIndex * 5 + placeIndex]! / observationCount) +
+        priorWeight * priorPlaceProbabilities[placeIndex]![candidateIndex]!,
     }))
     .filter((row) => row.p >= 0.0008)
     .sort((a, b) => b.p - a.p || (a.mint < b.mint ? -1 : a.mint > b.mint ? 1 : 0))
@@ -466,11 +527,91 @@ if (topCandidates.length < 5) {
 }
 
 const sizes: Array<{ place: number; bin: number; p: number }> = [];
+function erfc(value: number): number {
+  const z = Math.abs(value);
+  const t = 1 / (1 + 0.5 * z);
+  const approximation =
+    t *
+    Math.exp(
+      -z * z -
+        1.26551223 +
+        t *
+          (1.00002368 +
+            t *
+              (0.37409196 +
+                t *
+                  (0.09678418 +
+                    t *
+                      (-0.18628806 +
+                        t *
+                          (0.27886807 +
+                            t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))),
+    );
+  return value >= 0 ? approximation : 2 - approximation;
+}
+function normalTail(value: number, mean: number, standardDeviation: number): number {
+  if (value === -Infinity) return 1;
+  if (value === Infinity) return 0;
+  return 0.5 * erfc((value - mean) / (standardDeviation * Math.SQRT2));
+}
+function normalize(values: number[]): number[] {
+  const total = values.reduce((sum, value) => sum + value, 0);
+  if (!(total > 0)) throw new Error('size distribution has no mass');
+  return values.map((value) => value / total);
+}
+
+const binCenters = Array.from({ length: 82 }, (_, bin) =>
+  bin === 0 ? edges[0]! - 0.5 : bin === 81 ? edges[80]! + 0.5 : (edges[bin - 1]! + edges[bin]!) / 2,
+);
 for (let placeIndex = 0; placeIndex < 5; placeIndex++) {
   const counts = Array.from({ length: 82 }, (_, bin) => sizeCounts[placeIndex * 82 + bin]!);
   const denominator = observationCount + 0.6 * 82;
-  const roundedMicros = counts.map((count) => Math.round(((count + 0.6) / denominator) * 1_000_000));
-  const largestBin = counts.reduce((best, count, bin) => (count > counts[best]! ? bin : best), 0);
+  const mcSizes = counts.map((count) => (count + 0.6) / denominator);
+
+  const place = placeIndex + 1;
+  const placeRow = lastMarkRows.find((row) => row.rank === place) ?? orderedLastRows[placeIndex];
+  let priorMean: number;
+  if (placeRow !== undefined) {
+    priorMean = Math.log10(Number(BigInt(placeRow.market_cap_lamports)) / 1e9);
+  } else {
+    const smallestCap = Math.min(
+      ...lastMarkRows.map((row) => Math.log10(Number(BigInt(row.market_cap_lamports)) / 1e9)),
+    );
+    priorMean = smallestCap - 0.12 * (place - lastMarkRows.length);
+  }
+  const priorSizes = normalize(
+    Array.from({ length: 82 }, (_, bin) => {
+      const low = bin === 0 ? -Infinity : edges[bin - 1]!;
+      const high = bin === 81 ? Infinity : edges[bin]!;
+      return normalTail(low, priorMean, 0.45) - normalTail(high, priorMean, 0.45);
+    }),
+  );
+  let sizeOut = normalize(
+    mcSizes.map((probability, bin) => (1 - priorWeight) * probability + priorWeight * priorSizes[bin]!),
+  );
+
+  const sizeMean = sizeOut.reduce((sum, probability, bin) => sum + probability * binCenters[bin]!, 0);
+  const sizeVariance = sizeOut.reduce(
+    (sum, probability, bin) => sum + probability * (binCenters[bin]! - sizeMean) ** 2,
+    0,
+  );
+  const sizeSd = Math.sqrt(sizeVariance);
+  if (sizeSd < 0.3) {
+    const smoothingSd = Math.sqrt(0.3 ** 2 - sizeSd ** 2);
+    const kernels = binCenters.map((inputCenter) =>
+      normalize(
+        binCenters.map((outputCenter) => Math.exp(-0.5 * ((outputCenter - inputCenter) / smoothingSd) ** 2)),
+      ),
+    );
+    sizeOut = normalize(
+      binCenters.map((_, outputBin) =>
+        sizeOut.reduce((sum, probability, inputBin) => sum + probability * kernels[inputBin]![outputBin]!, 0),
+      ),
+    );
+  }
+
+  const roundedMicros = sizeOut.map((probability) => Math.round(probability * 1_000_000));
+  const largestBin = sizeOut.reduce((best, probability, bin) => (probability > sizeOut[best]! ? bin : best), 0);
   const roundedTotal = roundedMicros.reduce((sum, value) => sum + value, 0);
   roundedMicros[largestBin] = Math.max(0, roundedMicros[largestBin]! + 1_000_000 - roundedTotal);
   for (let bin = 0; bin < 82; bin++) {
